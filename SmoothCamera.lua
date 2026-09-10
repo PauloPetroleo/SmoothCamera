@@ -19,27 +19,24 @@ local TOGGLE_KEY = Enum.KeyCode.V
 -- SUAVIZAÇÃO
 ------------------------------------------------------------
 
--- Posição:
--- maior = acompanha mais rápido
+-- Posição continua relativamente responsiva.
 local POSITION_FREQUENCY = 5.8
 
--- Rotação:
--- valor mediano para dar aquela sensação suave
--- sem deixar a câmera pesada.
-local ROTATION_FREQUENCY = 6.5
+-- Rotação bem mais calma e suave.
+-- Menor = mais macia / mais atrasada.
+local ROTATION_FREQUENCY = 3.6
 
 ------------------------------------------------------------
 -- COMPENSAÇÃO DO ATRASO DA POSIÇÃO
 --
--- Não força a câmera a ficar atrás do personagem.
--- Só corrige um pouco o erro criado pela Spring de posição.
+-- Bem leve para não puxar a câmera agressivamente.
 ------------------------------------------------------------
 
-local POSITION_YAW_ASSIST = 0.65
+local POSITION_YAW_ASSIST = 0.45
 
 local YAW_SOFT_ZONE = math.rad(3.5)
 
-local MAX_YAW_ASSIST = math.rad(10)
+local MAX_YAW_ASSIST = math.rad(7)
 
 ------------------------------------------------------------
 -- ALVO
@@ -49,8 +46,6 @@ local LOOK_OFFSET = Vector3.new(0, 1.45, 0)
 
 ------------------------------------------------------------
 -- SPRING
---
--- Criticamente amortecida, estilo Freecam.
 ------------------------------------------------------------
 
 local Spring = {}
@@ -114,15 +109,7 @@ local enabled = false
 local positionSpring = nil
 local rotationSpring = nil
 
-------------------------------------------------------------
--- CAMERA RAW
---
--- Guarda a câmera produzida originalmente pelo Roblox.
---
--- Antes do CameraModule calcular o próximo frame,
--- restauramos essa versão.
-------------------------------------------------------------
-
+-- Último CFrame produzido pela câmera ORIGINAL do Roblox.
 local lastRawCameraCFrame = nil
 
 ------------------------------------------------------------
@@ -205,17 +192,12 @@ local function directionToYaw(direction)
 end
 
 ------------------------------------------------------------
--- COMPENSAÇÃO DA POSIÇÃO
+-- COMPENSAÇÃO DO ATRASO DA POSIÇÃO
 --
--- Compara:
+-- Não tenta apontar a câmera diretamente para o jogador.
 --
--- câmera original -> jogador
---
--- com:
---
--- câmera suavizada -> jogador
---
--- Corrige só a diferença causada pelo atraso da posição.
+-- Apenas mede a diferença causada pela posição suavizada
+-- estar um pouco atrasada em relação à câmera original.
 ------------------------------------------------------------
 
 local function calculatePositionYawAssist(
@@ -260,6 +242,8 @@ local function calculatePositionYawAssist(
 
 	--------------------------------------------------------
 	-- SOFT ZONE
+	--
+	-- Pequenos desvios ficam completamente naturais.
 	--------------------------------------------------------
 
 	local amount =
@@ -304,7 +288,7 @@ local function resetCameraState()
 		rawCFrame
 
 	--------------------------------------------------------
-	-- POSIÇÃO
+	-- POSITION SPRING
 	--------------------------------------------------------
 
 	positionSpring =
@@ -314,7 +298,7 @@ local function resetCameraState()
 		)
 
 	--------------------------------------------------------
-	-- ROTAÇÃO
+	-- ROTATION SPRING
 	--------------------------------------------------------
 
 	local pitch, yaw =
@@ -333,10 +317,12 @@ end
 ------------------------------------------------------------
 -- PRE CAMERA
 --
--- Roda antes da câmera padrão do Roblox.
+-- Antes do CameraModule do Roblox:
 --
--- Remove nosso efeito do frame anterior para o
--- CameraModule não usar nossa câmera suavizada como base.
+-- restaura a câmera RAW anterior.
+--
+-- Isso impede nossa suavização de entrar novamente
+-- no cálculo da câmera padrão no frame seguinte.
 ------------------------------------------------------------
 
 local function preCameraUpdate()
@@ -364,7 +350,10 @@ end
 ------------------------------------------------------------
 -- POST CAMERA
 --
--- Roda depois da câmera padrão do Roblox.
+-- Depois do CameraModule:
+--
+-- pega o resultado original do Roblox e aplica
+-- nossa suavização somente visualmente.
 ------------------------------------------------------------
 
 local function postCameraUpdate(dt)
@@ -392,15 +381,12 @@ local function postCameraUpdate(dt)
 	local rawCFrame =
 		camera.CFrame
 
-	--------------------------------------------------------
-	-- Guarda antes de aplicar qualquer efeito.
-	--------------------------------------------------------
-
+	-- Salva antes de modificarmos.
 	lastRawCameraCFrame =
 		rawCFrame
 
 	--------------------------------------------------------
-	-- POSIÇÃO SUAVE
+	-- POSIÇÃO
 	--------------------------------------------------------
 
 	positionSpring:SetFreq(
@@ -414,16 +400,16 @@ local function postCameraUpdate(dt)
 		)
 
 	--------------------------------------------------------
-	-- ROTAÇÃO RAW
+	-- ROTAÇÃO ORIGINAL
 	--------------------------------------------------------
 
 	local rawPitch, rawYaw =
 		rawCFrame:ToOrientation()
 
 	--------------------------------------------------------
-	-- Evita problema quando YAW cruza:
+	-- CONTINUIDADE DO YAW
 	--
-	-- +180° -> -180°
+	-- Evita pulo quando cruza +180 / -180 graus.
 	--------------------------------------------------------
 
 	local targetYaw =
@@ -433,7 +419,7 @@ local function postCameraUpdate(dt)
 		)
 
 	--------------------------------------------------------
-	-- PEQUENA COMPENSAÇÃO DO ATRASO DA POSIÇÃO
+	-- ASSISTÊNCIA HORIZONTAL LEVE
 	--------------------------------------------------------
 
 	local targetPosition =
@@ -456,6 +442,9 @@ local function postCameraUpdate(dt)
 
 	--------------------------------------------------------
 	-- SPRING DE ROTAÇÃO
+	--
+	-- 3.6 deixa a câmera entrar e sair da rotação
+	-- de maneira bem mais tranquila.
 	--------------------------------------------------------
 
 	rotationSpring:SetFreq(
@@ -478,7 +467,7 @@ local function postCameraUpdate(dt)
 		smoothRotation.Y
 
 	--------------------------------------------------------
-	-- CÂMERA FINAL
+	-- CAMERA FINAL
 	--------------------------------------------------------
 
 	camera.CFrame =
@@ -551,7 +540,7 @@ local function disableCamera()
 	)
 
 	--------------------------------------------------------
-	-- DEVOLVE A CÂMERA ORIGINAL DO ROBLOX
+	-- DEVOLVE A CÂMERA ORIGINAL
 	--------------------------------------------------------
 
 	camera =
