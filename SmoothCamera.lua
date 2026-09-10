@@ -10,64 +10,74 @@ local camera = Workspace.CurrentCamera
 -- CONFIG
 ------------------------------------------------------------
 
-local BIND_NAME = "PremiumDynamicCamera"
+local PRE_BIND_NAME = "PremiumDynamicCamera_Pre"
+local POST_BIND_NAME = "PremiumDynamicCamera_Post"
+
 local TOGGLE_KEY = Enum.KeyCode.V
 
 ------------------------------------------------------------
 -- MOVIMENTO
 ------------------------------------------------------------
 
--- Spring da posição.
--- Maior = acompanha mais rápido.
 local POSITION_FREQUENCY = 5.2
 
 ------------------------------------------------------------
--- MIRA / ROTAÇÃO
+-- ASSISTÊNCIA HORIZONTAL
+--
+-- IMPORTANTE:
+--
+-- Ela NÃO mira diretamente no personagem.
+--
+-- Ela compensa somente o deslocamento horizontal
+-- causado pela posição suavizada da câmera.
 ------------------------------------------------------------
 
--- Quando o jogador está perto do centro:
--- câmera fica mais relaxada.
-local AIM_FREQUENCY_MIN = 3.2
+local AIM_FREQUENCY_MIN = 3.8
+local AIM_FREQUENCY_MAX = 8.0
 
--- Quando o jogador se afasta do centro:
--- câmera começa a corrigir mais forte.
-local AIM_FREQUENCY_MAX = 8.5
+-- Pequenos erros ficam naturais.
+local SOFT_ZONE_YAW = math.rad(3.5)
 
--- Região central onde pequenos desvios são permitidos.
-local SOFT_ZONE_YAW = math.rad(4.5)
-local SOFT_ZONE_PITCH = math.rad(3.2)
-
--- A partir deste multiplicador da soft-zone,
--- a assistência chega praticamente ao máximo.
+-- Intensidade para atingir frequência máxima.
 local AIM_FULL_ASSIST = 3.0
+
+-- Limite absoluto da compensação.
+local MAX_YAW_CORRECTION = math.rad(14)
 
 ------------------------------------------------------------
 -- COLISÃO
 ------------------------------------------------------------
 
 local CAMERA_RADIUS = 0.35
-local WALL_PADDING = 0.2
+local WALL_PADDING = 0.20
 
 ------------------------------------------------------------
 -- ROTEAMENTO
 ------------------------------------------------------------
 
-local WAYPOINT_REACHED_DISTANCE = 0.45
-local ROUTE_REPLAN_INTERVAL = 0.075
+local WAYPOINT_REACHED_DISTANCE = 0.55
 
--- Evita ficar alternando rota nas quinas.
-local DIRECT_PATH_HOLD = 0.075
+local ROUTE_REPLAN_INTERVAL = 0.055
+local DIRECT_PATH_HOLD = 0.025
 
+local MAX_ROUTE_AGE = 0.65
+
+local ROUTE_STUCK_TIME = 0.18
+local ROUTE_PROGRESS_EPSILON = 0.035
+
+-- Menos amostras que antes.
+-- Isso reduz MUITO o número de Spherecasts.
 local ROUTE_SAMPLE_DISTANCES = {
-	1.1,
-	2.1,
-	3.4,
+	1.15,
+	2.25,
+	3.5,
 }
 
--- Prefere contornar lateralmente em vez
--- de fazer movimentos verticais estranhos.
-local VERTICAL_ROUTE_PENALTY = 0.45
+-- Só os melhores primeiros candidatos
+-- podem gerar uma rota de dois pontos.
+local MAX_DOUBLE_ROUTE_STARTS = 6
 
+local VERTICAL_ROUTE_PENALTY = 0.65
 local TURN_ROUTE_PENALTY = 0.35
 
 ------------------------------------------------------------
@@ -78,7 +88,6 @@ local LOOK_OFFSET = Vector3.new(0, 1.45, 0)
 
 ------------------------------------------------------------
 -- SPRING
--- Mesmo estilo matemático da Freecam do Roblox.
 ------------------------------------------------------------
 
 local Spring = {}
@@ -139,14 +148,39 @@ end
 
 local enabled = false
 
-local positionSpring
-local aimSpring
+local positionSpring = nil
+local yawCorrectionSpring = nil
+
+------------------------------------------------------------
+-- CAMERA RAW
+--
+-- Guarda o CFrame produzido pelo Roblox SEM nosso efeito.
+--
+-- Antes do CameraModule rodar no próximo frame,
+-- restauramos esse CFrame.
+------------------------------------------------------------
+
+local lastRawCameraCFrame = nil
+
+------------------------------------------------------------
+-- ÚLTIMA POSIÇÃO SEGURA
+------------------------------------------------------------
+
+local lastSafePosition = nil
+
+------------------------------------------------------------
+-- ROUTE STATE
+------------------------------------------------------------
 
 local route = {}
 local routeIndex = 1
 
 local lastRoutePlan = 0
 local directClearTimer = 0
+
+local routeCreatedAt = 0
+local routeLastProgressTime = 0
+local routeBestDistance = math.huge
 
 ------------------------------------------------------------
 -- CAST PARAMS
@@ -159,6 +193,15 @@ castParams.FilterType =
 
 castParams.IgnoreWater = true
 castParams.RespectCanCollide = true
+
+------------------------------------------------------------
+-- OVERLAP PARAMS
+------------------------------------------------------------
+
+local overlapParams = OverlapParams.new()
+
+overlapParams.FilterType =
+	Enum.RaycastFilterType.Exclude
 
 ------------------------------------------------------------
 -- CHARACTER
@@ -184,7 +227,8 @@ local function getCharacter()
 end
 
 local function getLookTarget()
-	local character, root = getCharacter()
+	local character, root =
+		getCharacter()
 
 	if not character or not root then
 		return nil
@@ -193,15 +237,24 @@ local function getLookTarget()
 	return root.Position + LOOK_OFFSET
 end
 
-local function updateFilter()
+local function updateFilters()
 	local character = player.Character
 
 	if character then
+
 		castParams.FilterDescendantsInstances = {
 			character
 		}
+
+		overlapParams.FilterDescendantsInstances = {
+			character
+		}
+
 	else
+
 		castParams.FilterDescendantsInstances = {}
+		overlapParams.FilterDescendantsInstances = {}
+
 	end
 end
 
@@ -214,12 +267,29 @@ local function safeUnit(vector, fallback)
 		return vector.Unit
 	end
 
-	return fallback or Vector3.new(0, 0, -1)
+	return fallback
+		or Vector3.new(0, 0, -1)
 end
 
 local function clearRoute()
 	table.clear(route)
+
 	routeIndex = 1
+
+	routeCreatedAt = 0
+	routeLastProgressTime = 0
+	routeBestDistance = math.huge
+end
+
+local function beginRoute(newRoute)
+	route = newRoute
+	routeIndex = 1
+
+	local now = os.clock()
+
+	routeCreatedAt = now
+	routeLastProgressTime = now
+	routeBestDistance = math.huge
 end
 
 local function currentWaypoint()
@@ -227,13 +297,14 @@ local function currentWaypoint()
 end
 
 ------------------------------------------------------------
--- CAST
+-- SPHERECAST
 ------------------------------------------------------------
 
 local function castBetween(a, b)
-	updateFilter()
+	updateFilters()
 
-	local direction = b - a
+	local direction =
+		b - a
 
 	if direction.Magnitude <= 0.001 then
 		return nil
@@ -252,10 +323,50 @@ local function pathClear(a, b)
 end
 
 ------------------------------------------------------------
--- SUPERFÍCIE
+-- OVERLAP SAFETY
+--
+-- Spherecast sozinho pode ter problemas se a esfera
+-- já estiver começando dentro de alguma geometria.
+--
+-- Isso funciona como uma segunda proteção.
 ------------------------------------------------------------
 
-local function safePositionBeforeHit(a, b, hit)
+local function isSolidOverlap(position)
+	updateFilters()
+
+	local parts =
+		Workspace:GetPartBoundsInRadius(
+			position,
+			CAMERA_RADIUS * 0.92,
+			overlapParams
+		)
+
+	for _, part in ipairs(parts) do
+		if
+			part:IsA("BasePart")
+			and
+			part.CanCollide
+			and
+			part.Transparency < 1
+		then
+
+			return true
+		end
+	end
+
+	return false
+end
+
+------------------------------------------------------------
+-- POSIÇÃO SEGURA
+------------------------------------------------------------
+
+local function safePositionBeforeHit(
+	a,
+	b,
+	hit
+)
+
 	if not hit then
 		return b
 	end
@@ -265,15 +376,18 @@ local function safePositionBeforeHit(a, b, hit)
 
 	local distance =
 		math.max(
-			hit.Distance - WALL_PADDING,
+			hit.Distance
+				- WALL_PADDING,
 			0
 		)
 
-	return a + direction * distance
+	return
+		a
+		+ direction * distance
 end
 
 ------------------------------------------------------------
--- VELOCIDADE NA PAREDE
+-- REMOVE VELOCIDADE PRA DENTRO DA PAREDE
 ------------------------------------------------------------
 
 local function removeIntoSurfaceVelocity(normal)
@@ -281,15 +395,18 @@ local function removeIntoSurfaceVelocity(normal)
 		return
 	end
 
-	local velocity = positionSpring.v
+	local velocity =
+		positionSpring.v
 
 	local amount =
 		velocity:Dot(normal)
 
 	if amount < 0 then
+
 		positionSpring.v =
 			velocity
 			- normal * amount
+
 	end
 end
 
@@ -302,10 +419,12 @@ local function getSurfaceBasis(normal)
 		normal:Cross(Vector3.yAxis)
 
 	if side.Magnitude < 0.05 then
+
 		side =
 			normal:Cross(
 				Vector3.xAxis
 			)
+
 	end
 
 	side =
@@ -325,44 +444,67 @@ end
 
 ------------------------------------------------------------
 -- CANDIDATOS DE ROTA
+--
+-- Antes tínhamos 8 direções.
+--
+-- Agora são 6 e priorizamos contorno lateral.
 ------------------------------------------------------------
 
 local function generateCandidates(hit)
 	local candidates = {}
 
-	local normal = hit.Normal
+	local normal =
+		hit.Normal
+
 	local side, surfaceUp =
 		getSurfaceBasis(normal)
 
 	local base =
 		hit.Position
 		+ normal
-		* (CAMERA_RADIUS + WALL_PADDING)
+		* (
+			CAMERA_RADIUS
+			+ WALL_PADDING
+		)
 
 	local directions = {
+
 		side,
 		-side,
 
-		surfaceUp,
-		-surfaceUp,
+		safeUnit(
+			side + surfaceUp * 0.65
+		),
 
-		safeUnit(side + surfaceUp),
-		safeUnit(-side + surfaceUp),
+		safeUnit(
+			-side + surfaceUp * 0.65
+		),
 
-		safeUnit(side - surfaceUp),
-		safeUnit(-side - surfaceUp),
+		safeUnit(
+			side - surfaceUp * 0.45
+		),
+
+		safeUnit(
+			-side - surfaceUp * 0.45
+		),
 	}
 
 	for _, distance in ipairs(
 		ROUTE_SAMPLE_DISTANCES
 	) do
+
 		for _, direction in ipairs(
 			directions
 		) do
+
 			table.insert(
 				candidates,
-				base + direction * distance
+
+				base
+				+ direction
+				* distance
 			)
+
 		end
 	end
 
@@ -370,7 +512,7 @@ local function generateCandidates(hit)
 end
 
 ------------------------------------------------------------
--- SCORE DA ROTA
+-- ROUTE SCORE
 ------------------------------------------------------------
 
 local function routeScore(
@@ -384,11 +526,13 @@ local function routeScore(
 	local previousPosition =
 		startPosition
 
-	local previousDirection
+	local previousDirection = nil
 
 	for _, point in ipairs(points) do
+
 		local delta =
-			point - previousPosition
+			point
+			- previousPosition
 
 		local distance =
 			delta.Magnitude
@@ -400,10 +544,12 @@ local function routeScore(
 			* VERTICAL_ROUTE_PENALTY
 
 		if distance > 0.001 then
+
 			local direction =
 				delta.Unit
 
 			if previousDirection then
+
 				local dot =
 					math.clamp(
 						previousDirection:Dot(
@@ -416,6 +562,7 @@ local function routeScore(
 				score +=
 					(1 - dot)
 					* TURN_ROUTE_PENALTY
+
 			end
 
 			previousDirection =
@@ -427,7 +574,8 @@ local function routeScore(
 	end
 
 	local finalDelta =
-		finalGoal - previousPosition
+		finalGoal
+		- previousPosition
 
 	score += finalDelta.Magnitude
 
@@ -439,7 +587,7 @@ local function routeScore(
 end
 
 ------------------------------------------------------------
--- 1 WAYPOINT
+-- SINGLE ROUTE
 ------------------------------------------------------------
 
 local function findSingleRoute(
@@ -448,39 +596,40 @@ local function findSingleRoute(
 	firstHit
 )
 
-	local bestRoute
+	local bestRoute = nil
 	local bestScore = math.huge
 
 	for _, candidate in ipairs(
 		generateCandidates(firstHit)
 	) do
 
-		if
-			pathClear(
-				startPosition,
-				candidate
-			)
-			and
-			pathClear(
+		if pathClear(
+			startPosition,
+			candidate
+		) then
+
+			if pathClear(
 				candidate,
 				finalGoal
-			)
-		then
+			) then
 
-			local testRoute = {
-				candidate
-			}
+				local testRoute = {
+					candidate
+				}
 
-			local score =
-				routeScore(
-					startPosition,
-					testRoute,
-					finalGoal
-				)
+				local score =
+					routeScore(
+						startPosition,
+						testRoute,
+						finalGoal
+					)
 
-			if score < bestScore then
-				bestScore = score
-				bestRoute = testRoute
+				if score < bestScore then
+
+					bestScore = score
+					bestRoute = testRoute
+
+				end
 			end
 		end
 	end
@@ -489,7 +638,64 @@ local function findSingleRoute(
 end
 
 ------------------------------------------------------------
--- 2 WAYPOINTS
+-- PEGAR MELHORES PRIMEIROS CANDIDATOS
+------------------------------------------------------------
+
+local function getBestFirstCandidates(
+	startPosition,
+	finalGoal,
+	firstHit
+)
+
+	local results = {}
+
+	for _, point in ipairs(
+		generateCandidates(firstHit)
+	) do
+
+		if pathClear(
+			startPosition,
+			point
+		) then
+
+			local score =
+				(startPosition - point).Magnitude
+				+
+				(point - finalGoal).Magnitude
+
+			score +=
+				math.abs(
+					point.Y
+					- startPosition.Y
+				)
+				* VERTICAL_ROUTE_PENALTY
+
+			table.insert(
+				results,
+				{
+					point = point,
+					score = score,
+				}
+			)
+
+		end
+	end
+
+	table.sort(
+		results,
+
+		function(a, b)
+			return a.score < b.score
+		end
+	)
+
+	return results
+end
+
+------------------------------------------------------------
+-- DOUBLE ROUTE
+--
+-- Agora NÃO testa todos contra todos.
 ------------------------------------------------------------
 
 local function findDoubleRoute(
@@ -498,49 +704,57 @@ local function findDoubleRoute(
 	firstHit
 )
 
-	local bestRoute
+	local bestRoute = nil
 	local bestScore = math.huge
 
 	local firstCandidates =
-		generateCandidates(firstHit)
-
-	for _, firstPoint in ipairs(
-		firstCandidates
-	) do
-
-		if pathClear(
+		getBestFirstCandidates(
 			startPosition,
-			firstPoint
-		) then
+			finalGoal,
+			firstHit
+		)
 
-			local secondHit =
-				castBetween(
-					firstPoint,
-					finalGoal
+	local amount =
+		math.min(
+			#firstCandidates,
+			MAX_DOUBLE_ROUTE_STARTS
+		)
+
+	for i = 1, amount do
+
+		local firstPoint =
+			firstCandidates[i].point
+
+		local secondHit =
+			castBetween(
+				firstPoint,
+				finalGoal
+			)
+
+		if secondHit then
+
+			local secondCandidates =
+				generateCandidates(
+					secondHit
 				)
 
-			if secondHit then
-				for _, secondPoint in ipairs(
-					generateCandidates(
-						secondHit
-					)
-				) do
+			for _, secondPoint in ipairs(
+				secondCandidates
+			) do
 
-					if
-						pathClear(
-							firstPoint,
-							secondPoint
-						)
-						and
-						pathClear(
-							secondPoint,
-							finalGoal
-						)
-					then
+				if pathClear(
+					firstPoint,
+					secondPoint
+				) then
+
+					if pathClear(
+						secondPoint,
+						finalGoal
+					) then
 
 						local testRoute = {
 							firstPoint,
-							secondPoint
+							secondPoint,
 						}
 
 						local score =
@@ -551,8 +765,13 @@ local function findDoubleRoute(
 							)
 
 						if score < bestScore then
-							bestScore = score
-							bestRoute = testRoute
+
+							bestScore =
+								score
+
+							bestRoute =
+								testRoute
+
 						end
 					end
 				end
@@ -582,6 +801,57 @@ local function planRoute(
 		return {}
 	end
 
+	--------------------------------------------------------
+	-- PRIMEIRO: tenta deslizar naturalmente.
+	--------------------------------------------------------
+
+	local desired =
+		finalGoal
+		- startPosition
+
+	local tangent =
+		desired
+		- hit.Normal
+		* desired:Dot(hit.Normal)
+
+	if tangent.Magnitude > 0.05 then
+
+		local slideGoal =
+			hit.Position
+			+ hit.Normal
+			* (
+				CAMERA_RADIUS
+				+ WALL_PADDING
+			)
+			+ tangent.Unit
+			* math.min(
+				tangent.Magnitude,
+				1.5
+			)
+
+		if
+			pathClear(
+				startPosition,
+				slideGoal
+			)
+			and
+			pathClear(
+				slideGoal,
+				finalGoal
+			)
+		then
+
+			return {
+				slideGoal
+			}
+
+		end
+	end
+
+	--------------------------------------------------------
+	-- UM WAYPOINT
+	--------------------------------------------------------
+
 	local single =
 		findSingleRoute(
 			startPosition,
@@ -592,6 +862,10 @@ local function planRoute(
 	if single then
 		return single
 	end
+
+	--------------------------------------------------------
+	-- DOIS WAYPOINTS
+	--------------------------------------------------------
 
 	local double =
 		findDoubleRoute(
@@ -604,6 +878,10 @@ local function planRoute(
 		return double
 	end
 
+	--------------------------------------------------------
+	-- FALLBACK
+	--------------------------------------------------------
+
 	return {
 		safePositionBeforeHit(
 			startPosition,
@@ -614,7 +892,7 @@ local function planRoute(
 end
 
 ------------------------------------------------------------
--- ROUTE VALIDATION
+-- ROTA AINDA É VÁLIDA?
 ------------------------------------------------------------
 
 local function routeStillValid(
@@ -633,22 +911,30 @@ local function routeStillValid(
 		currentPosition,
 		waypoint
 	) then
+
 		return false
+
 	end
 
-	local previous = waypoint
+	local previous =
+		waypoint
 
 	for i = routeIndex + 1, #route do
-		local point = route[i]
+
+		local point =
+			route[i]
 
 		if not pathClear(
 			previous,
 			point
 		) then
+
 			return false
+
 		end
 
-		previous = point
+		previous =
+			point
 	end
 
 	return pathClear(
@@ -658,14 +944,60 @@ local function routeStillValid(
 end
 
 ------------------------------------------------------------
--- WAYPOINT PROGRESS
+-- ATUALIZA PROGRESSO
 ------------------------------------------------------------
 
 local function updateRouteProgress(
-	position
+	position,
+	finalGoal
 )
 
+	--------------------------------------------------------
+	-- CAMINHO DIRETO?
+	--------------------------------------------------------
+
+	if pathClear(
+		position,
+		finalGoal
+	) then
+
+		clearRoute()
+		return
+
+	end
+
+	--------------------------------------------------------
+	-- PULA WAYPOINTS DESNECESSÁRIOS
+	--------------------------------------------------------
+
+	if #route > 0 then
+
+		for i = #route, routeIndex + 1, -1 do
+
+			if pathClear(
+				position,
+				route[i]
+			) then
+
+				routeIndex = i
+
+				routeBestDistance =
+					math.huge
+
+				routeLastProgressTime =
+					os.clock()
+
+				break
+			end
+		end
+	end
+
+	--------------------------------------------------------
+	-- CHEGOU NO WAYPOINT?
+	--------------------------------------------------------
+
 	while true do
+
 		local waypoint =
 			currentWaypoint()
 
@@ -673,21 +1005,122 @@ local function updateRouteProgress(
 			break
 		end
 
-		if (
-			position - waypoint
-		).Magnitude
+		local distance =
+			(position - waypoint).Magnitude
+
+		if
+			distance
 			<= WAYPOINT_REACHED_DISTANCE
 		then
 
 			routeIndex += 1
+
+			routeBestDistance =
+				math.huge
+
+			routeLastProgressTime =
+				os.clock()
+
 		else
+
 			break
+
 		end
 	end
 
 	if routeIndex > #route then
 		clearRoute()
 	end
+end
+
+------------------------------------------------------------
+-- ANTI-STUCK
+------------------------------------------------------------
+
+local function routeIsStuck(
+	currentPosition,
+	finalGoal
+)
+
+	local waypoint =
+		currentWaypoint()
+
+	if not waypoint then
+		return false
+	end
+
+	local now =
+		os.clock()
+
+	--------------------------------------------------------
+	-- ROTA ANTIGA
+	--------------------------------------------------------
+
+	if
+		routeCreatedAt > 0
+		and
+		now - routeCreatedAt
+		> MAX_ROUTE_AGE
+	then
+
+		return true
+
+	end
+
+	--------------------------------------------------------
+	-- CAMINHO DIRETO ABRIU
+	--------------------------------------------------------
+
+	if pathClear(
+		currentPosition,
+		finalGoal
+	) then
+
+		return true
+
+	end
+
+	--------------------------------------------------------
+	-- PROGRESSO
+	--------------------------------------------------------
+
+	local distance =
+		(currentPosition - waypoint).Magnitude
+
+	if
+		distance
+		<
+		routeBestDistance
+			- ROUTE_PROGRESS_EPSILON
+	then
+
+		routeBestDistance =
+			distance
+
+		routeLastProgressTime =
+			now
+
+		return false
+
+	end
+
+	if routeLastProgressTime == 0 then
+
+		routeLastProgressTime =
+			now
+
+	end
+
+	if
+		now - routeLastProgressTime
+		> ROUTE_STUCK_TIME
+	then
+
+		return true
+
+	end
+
+	return false
 end
 
 ------------------------------------------------------------
@@ -701,8 +1134,13 @@ local function getNavigationGoal(
 )
 
 	updateRouteProgress(
-		currentPosition
+		currentPosition,
+		finalGoal
 	)
+
+	--------------------------------------------------------
+	-- DIRETO
+	--------------------------------------------------------
 
 	local directClear =
 		pathClear(
@@ -711,41 +1149,84 @@ local function getNavigationGoal(
 		)
 
 	if directClear then
+
 		directClearTimer += dt
 
-		if directClearTimer
+		if
+			directClearTimer
 			>= DIRECT_PATH_HOLD
 		then
 
 			clearRoute()
 
 			return finalGoal
+
 		end
+
 	else
+
 		directClearTimer = 0
+
 	end
+
+	--------------------------------------------------------
+	-- ROTA EXISTENTE
+	--------------------------------------------------------
 
 	local waypoint =
 		currentWaypoint()
 
 	if waypoint then
-		if routeStillValid(
+
+		if routeIsStuck(
+			currentPosition,
+			finalGoal
+		) then
+
+			clearRoute()
+
+		elseif routeStillValid(
 			currentPosition,
 			finalGoal
 		) then
 
 			return waypoint
-		end
 
-		clearRoute()
+		else
+
+			clearRoute()
+
+		end
 	end
 
-	local now = os.clock()
+	--------------------------------------------------------
+	-- REPLAN RATE LIMIT
+	--------------------------------------------------------
+
+	local now =
+		os.clock()
 
 	if
 		now - lastRoutePlan
 		< ROUTE_REPLAN_INTERVAL
 	then
+
+		----------------------------------------------------
+		-- TENTA DIRETO PRIMEIRO
+		----------------------------------------------------
+
+		if pathClear(
+			currentPosition,
+			finalGoal
+		) then
+
+			return finalGoal
+
+		end
+
+		----------------------------------------------------
+		-- SLIDE BARATO
+		----------------------------------------------------
 
 		local hit =
 			castBetween(
@@ -754,6 +1235,43 @@ local function getNavigationGoal(
 			)
 
 		if hit then
+
+			local desired =
+				finalGoal
+				- currentPosition
+
+			local tangent =
+				desired
+				- hit.Normal
+				* desired:Dot(
+					hit.Normal
+				)
+
+			if tangent.Magnitude > 0.05 then
+
+				local slideGoal =
+					hit.Position
+					+ hit.Normal
+					* (
+						CAMERA_RADIUS
+						+ WALL_PADDING
+					)
+					+ tangent.Unit
+					* math.min(
+						tangent.Magnitude,
+						1.25
+					)
+
+				if pathClear(
+					currentPosition,
+					slideGoal
+				) then
+
+					return slideGoal
+
+				end
+			end
+
 			return safePositionBeforeHit(
 				currentPosition,
 				finalGoal,
@@ -764,146 +1282,196 @@ local function getNavigationGoal(
 		return finalGoal
 	end
 
-	lastRoutePlan = now
+	--------------------------------------------------------
+	-- NOVA ROTA
+	--------------------------------------------------------
 
-	route =
+	lastRoutePlan =
+		now
+
+	local newRoute =
 		planRoute(
 			currentPosition,
 			finalGoal
 		)
 
-	routeIndex = 1
+	if #newRoute > 0 then
 
-	return
-		currentWaypoint()
-		or finalGoal
+		beginRoute(newRoute)
+
+		return
+			currentWaypoint()
+			or finalGoal
+
+	end
+
+	clearRoute()
+
+	return finalGoal
 end
 
 ------------------------------------------------------------
--- ANGLES
+-- ÂNGULOS
 ------------------------------------------------------------
 
-local function directionToAngles(direction)
+local function directionToYaw(direction)
 	direction =
 		safeUnit(direction)
 
-	local pitch =
-		math.asin(
-			math.clamp(
-				direction.Y,
-				-1,
-				1
-			)
-		)
-
-	local yaw =
-		math.atan2(
-			-direction.X,
-			-direction.Z
-		)
-
-	return Vector2.new(
-		pitch,
-		yaw
+	return math.atan2(
+		-direction.X,
+		-direction.Z
 	)
 end
 
-local function anglesToDirection(angles)
-	return CFrame.fromOrientation(
-		angles.X,
-		angles.Y,
-		0
-	).LookVector
-end
-
-local function shortestAngle(
-	current,
-	target
+local function shortestAngleDelta(
+	fromAngle,
+	toAngle
 )
 
-	local delta =
+	return
 		(
-			target
-			- current
+			toAngle
+			- fromAngle
 			+ math.pi
 		)
-		% (math.pi * 2)
+		% (2 * math.pi)
 		- math.pi
-
-	return current + delta
 end
 
 ------------------------------------------------------------
--- SOFT ZONE / AIM ASSIST
+-- CORREÇÃO DE YAW
+--
+-- AQUI ESTÁ A MUDANÇA GRANDE.
+--
+-- NÃO fazemos:
+--
+-- raw camera -> personagem
+--
+-- Fazemos:
+--
+-- ângulo necessário da posição RAW até personagem
+-- versus
+-- ângulo necessário da posição SUAVIZADA até personagem
+--
+-- Ou seja:
+-- corrigimos SOMENTE o erro criado pela Spring.
+------------------------------------------------------------
+
+local function calculateYawCorrection(
+	rawCameraCFrame,
+	finalCameraPosition,
+	targetPosition
+)
+
+	local rawPosition =
+		rawCameraCFrame.Position
+
+	--------------------------------------------------------
+	-- DIREÇÃO DO ALVO A PARTIR DA CÂMERA ORIGINAL
+	--------------------------------------------------------
+
+	local rawTargetDirection =
+		targetPosition
+		- rawPosition
+
+	if rawTargetDirection.Magnitude <= 0.001 then
+		return 0
+	end
+
+	--------------------------------------------------------
+	-- DIREÇÃO DO ALVO A PARTIR DA POSIÇÃO SUAVIZADA
+	--------------------------------------------------------
+
+	local smoothTargetDirection =
+		targetPosition
+		- finalCameraPosition
+
+	if smoothTargetDirection.Magnitude <= 0.001 then
+		return 0
+	end
+
+	local rawTargetYaw =
+		directionToYaw(
+			rawTargetDirection
+		)
+
+	local smoothTargetYaw =
+		directionToYaw(
+			smoothTargetDirection
+		)
+
+	--------------------------------------------------------
+	-- DIFERENÇA CRIADA SOMENTE PELO ATRASO DA POSIÇÃO
+	--------------------------------------------------------
+
+	local yawDifference =
+		shortestAngleDelta(
+			rawTargetYaw,
+			smoothTargetYaw
+		)
+
+	--------------------------------------------------------
+	-- SOFT ZONE
+	--------------------------------------------------------
+
+	local outside =
+		math.max(
+			math.abs(yawDifference)
+				- SOFT_ZONE_YAW,
+			0
+		)
+
+	if outside <= 0 then
+		return 0
+	end
+
+	local correction =
+		math.sign(yawDifference)
+		* outside
+
+	return math.clamp(
+		correction,
+		-MAX_YAW_CORRECTION,
+		MAX_YAW_CORRECTION
+	)
+end
+
+------------------------------------------------------------
+-- AIM FREQUENCY
 ------------------------------------------------------------
 
 local function calculateAimFrequency(
-	currentAngles,
-	targetAngles
+	yawCorrection
 )
 
-	local pitchError =
-		math.abs(
-			targetAngles.X
-			- currentAngles.X
+	local normalized =
+		math.abs(yawCorrection)
+		/
+		math.max(
+			SOFT_ZONE_YAW,
+			0.001
 		)
-
-	local yawTarget =
-		shortestAngle(
-			currentAngles.Y,
-			targetAngles.Y
-		)
-
-	local yawError =
-		math.abs(
-			yawTarget
-			- currentAngles.Y
-		)
-
-	--------------------------------------------------------
-	-- Quanto o alvo saiu da região central.
-	--------------------------------------------------------
-
-	local normalizedPitch =
-		pitchError / SOFT_ZONE_PITCH
-
-	local normalizedYaw =
-		yawError / SOFT_ZONE_YAW
-
-	local error =
-		math.sqrt(
-			normalizedPitch * normalizedPitch
-			+
-			normalizedYaw * normalizedYaw
-		)
-
-	--------------------------------------------------------
-	-- Dentro da soft zone:
-	-- frequência baixa.
-	--
-	-- Conforme sai:
-	-- frequência sobe progressivamente.
-	--------------------------------------------------------
 
 	local t =
 		math.clamp(
-			(error - 0.6)
-			/
-			(AIM_FULL_ASSIST - 0.6),
+			normalized
+				/ AIM_FULL_ASSIST,
 			0,
 			1
 		)
 
 	-- SmoothStep
 	t =
-		t * t * (3 - 2 * t)
+		t * t
+		* (3 - 2 * t)
 
 	return
 		AIM_FREQUENCY_MIN
 		+
 		(
 			AIM_FREQUENCY_MAX
-			- AIM_FREQUENCY_MIN
+				- AIM_FREQUENCY_MIN
 		)
 		* t
 end
@@ -923,25 +1491,81 @@ local function emergencyCollision(
 			newPosition
 		)
 
-	if not hit then
-		return newPosition
-	end
+	if hit then
 
-	local safePosition =
-		safePositionBeforeHit(
-			oldPosition,
-			newPosition,
-			hit
+		local safePosition =
+			safePositionBeforeHit(
+				oldPosition,
+				newPosition,
+				hit
+			)
+
+		positionSpring.p =
+			safePosition
+
+		removeIntoSurfaceVelocity(
+			hit.Normal
 		)
 
-	positionSpring.p =
-		safePosition
+		clearRoute()
 
-	removeIntoSurfaceVelocity(
-		hit.Normal
-	)
+		return safePosition
+	end
 
-	return safePosition
+	--------------------------------------------------------
+	-- SEGUNDA PROTEÇÃO:
+	-- detectar se terminamos dentro da geometria.
+	--------------------------------------------------------
+
+	if isSolidOverlap(newPosition) then
+
+		----------------------------------------------------
+		-- Volta para última posição realmente segura.
+		----------------------------------------------------
+
+		if
+			lastSafePosition
+			and
+			not isSolidOverlap(
+				lastSafePosition
+			)
+		then
+
+			positionSpring.p =
+				lastSafePosition
+
+			positionSpring.v =
+				Vector3.zero
+
+			clearRoute()
+
+			return lastSafePosition
+		end
+
+		----------------------------------------------------
+		-- Se não existe uma posição anterior segura,
+		-- simplesmente não avança nesse frame.
+		----------------------------------------------------
+
+		positionSpring.p =
+			oldPosition
+
+		positionSpring.v =
+			Vector3.zero
+
+		clearRoute()
+
+		return oldPosition
+	end
+
+	--------------------------------------------------------
+	-- POSIÇÃO BOA
+	--------------------------------------------------------
+
+	lastSafePosition =
+		newPosition
+
+	return newPosition
 end
 
 ------------------------------------------------------------
@@ -949,21 +1573,21 @@ end
 ------------------------------------------------------------
 
 local function resetCameraState()
-	camera = Workspace.CurrentCamera
+	camera =
+		Workspace.CurrentCamera
 
 	if not camera then
 		return
 	end
 
-	local target =
-		getLookTarget()
+	local rawCFrame =
+		camera.CFrame
 
-	if not target then
-		return
-	end
+	lastRawCameraCFrame =
+		rawCFrame
 
 	local position =
-		camera.CFrame.Position
+		rawCFrame.Position
 
 	positionSpring =
 		Spring.new(
@@ -971,22 +1595,14 @@ local function resetCameraState()
 			position
 		)
 
-	local direction =
-		target - position
-
-	if direction.Magnitude <= 0.001 then
-		direction =
-			camera.CFrame.LookVector
-	end
-
-	local angles =
-		directionToAngles(direction)
-
-	aimSpring =
+	yawCorrectionSpring =
 		Spring.new(
 			AIM_FREQUENCY_MIN,
-			angles
+			0
 		)
+
+	lastSafePosition =
+		position
 
 	clearRoute()
 
@@ -995,11 +1611,44 @@ local function resetCameraState()
 end
 
 ------------------------------------------------------------
--- UPDATE CAMERA
+-- PRE CAMERA
+--
+-- Roda ANTES do CameraModule.
+--
+-- Remove completamente o nosso efeito visual anterior,
+-- então o Roblox não usa nossa câmera modificada
+-- como ponto inicial do próximo frame.
 ------------------------------------------------------------
 
-local function updateCamera(dt)
-	camera = Workspace.CurrentCamera
+local function preCameraUpdate()
+	if not enabled then
+		return
+	end
+
+	camera =
+		Workspace.CurrentCamera
+
+	if not camera then
+		return
+	end
+
+	if lastRawCameraCFrame then
+
+		camera.CFrame =
+			lastRawCameraCFrame
+
+	end
+end
+
+------------------------------------------------------------
+-- POST CAMERA
+--
+-- Roda DEPOIS do CameraModule.
+------------------------------------------------------------
+
+local function postCameraUpdate(dt)
+	camera =
+		Workspace.CurrentCamera
 
 	if not camera then
 		return
@@ -1012,8 +1661,10 @@ local function updateCamera(dt)
 		return
 	end
 
-	if not positionSpring
-		or not aimSpring
+	if
+		not positionSpring
+		or
+		not yawCorrectionSpring
 	then
 
 		resetCameraState()
@@ -1021,11 +1672,21 @@ local function updateCamera(dt)
 	end
 
 	--------------------------------------------------------
-	-- DESTINO GERADO PELA CÂMERA NORMAL DO ROBLOX
+	-- CFRAME ORIGINAL DO ROBLOX DESTE FRAME
 	--------------------------------------------------------
 
+	local rawCameraCFrame =
+		camera.CFrame
+
+	--------------------------------------------------------
+	-- GUARDA PARA RESTAURAR NO PRÓXIMO PRE-STEP
+	--------------------------------------------------------
+
+	lastRawCameraCFrame =
+		rawCameraCFrame
+
 	local desiredPosition =
-		camera.CFrame.Position
+		rawCameraCFrame.Position
 
 	local previousPosition =
 		positionSpring.p
@@ -1042,7 +1703,7 @@ local function updateCamera(dt)
 		)
 
 	--------------------------------------------------------
-	-- SPRING DE MOVIMENTO
+	-- POSITION SPRING
 	--------------------------------------------------------
 
 	positionSpring:SetFreq(
@@ -1056,7 +1717,7 @@ local function updateCamera(dt)
 		)
 
 	--------------------------------------------------------
-	-- SEGURANÇA DE COLISÃO
+	-- COLLISION
 	--------------------------------------------------------
 
 	local finalPosition =
@@ -1069,10 +1730,7 @@ local function updateCamera(dt)
 		finalPosition
 
 	--------------------------------------------------------
-	-- POSIÇÃO ATUAL DO JOGADOR
-	--
-	-- É recalculada depois da posição para que a mira
-	-- sempre persiga o jogador atual, não um ponto velho.
+	-- ALVO ATUALIZADO
 	--------------------------------------------------------
 
 	targetPosition =
@@ -1082,80 +1740,72 @@ local function updateCamera(dt)
 		return
 	end
 
-	local exactDirection =
-		targetPosition - finalPosition
+	--------------------------------------------------------
+	-- YAW ASSIST
+	--
+	-- COMPENSA SÓ A DIFERENÇA CRIADA
+	-- PELA POSIÇÃO SUAVIZADA.
+	--------------------------------------------------------
 
-	if exactDirection.Magnitude <= 0.001 then
-		return
-	end
-
-	local targetAngles =
-		directionToAngles(
-			exactDirection
+	local desiredYawCorrection =
+		calculateYawCorrection(
+			rawCameraCFrame,
+			finalPosition,
+			targetPosition
 		)
-
-	--------------------------------------------------------
-	-- YAW PELO CAMINHO MAIS CURTO
-	--
-	-- Isso NÃO limita 360 graus.
-	--------------------------------------------------------
-
-	targetAngles =
-		Vector2.new(
-			targetAngles.X,
-
-			shortestAngle(
-				aimSpring.p.Y,
-				targetAngles.Y
-			)
-		)
-
-	--------------------------------------------------------
-	-- SOFT-ZONE DINÂMICA
-	--
-	-- Pequena diferença:
-	-- câmera deixa acontecer.
-	--
-	-- Grande diferença:
-	-- câmera aumenta a força da correção.
-	--------------------------------------------------------
 
 	local aimFrequency =
 		calculateAimFrequency(
-			aimSpring.p,
-			targetAngles
+			desiredYawCorrection
 		)
 
-	aimSpring:SetFreq(
+	yawCorrectionSpring:SetFreq(
 		aimFrequency
 	)
 
-	--------------------------------------------------------
-	-- SPRING DE MIRA
-	--------------------------------------------------------
-
-	local smoothAngles =
-		aimSpring:Update(
+	local smoothYawCorrection =
+		yawCorrectionSpring:Update(
 			dt,
-			targetAngles
-		)
-
-	local smoothDirection =
-		anglesToDirection(
-			smoothAngles
+			desiredYawCorrection
 		)
 
 	--------------------------------------------------------
-	-- CÂMERA FINAL
+	-- MANTÉM TODA A ROTAÇÃO ORIGINAL DO ROBLOX
+	--
+	-- Inclusive pitch, mobile follow etc.
+	--
+	-- E apenas adiciona yaw local/global.
+	--------------------------------------------------------
+
+	local rawRotation =
+		rawCameraCFrame.Rotation
+
+	local yawRotation =
+		CFrame.Angles(
+			0,
+			smoothYawCorrection,
+			0
+		)
+
+	--------------------------------------------------------
+	-- YAW É APLICADO EM WORLD SPACE.
+	--
+	-- Isso evita alterar pitch.
+	--------------------------------------------------------
+
+	local finalRotation =
+		yawRotation
+		* rawRotation
+
+	--------------------------------------------------------
+	-- CAMERA FINAL
 	--------------------------------------------------------
 
 	camera.CFrame =
-		CFrame.lookAt(
-			finalPosition,
+		CFrame.new(
 			finalPosition
-				+ smoothDirection,
-			Vector3.yAxis
 		)
+		* finalRotation
 end
 
 ------------------------------------------------------------
@@ -1171,13 +1821,29 @@ local function enableCamera()
 
 	resetCameraState()
 
+	--------------------------------------------------------
+	-- ANTES DO CAMERA MODULE
+	--------------------------------------------------------
+
 	RunService:BindToRenderStep(
-		BIND_NAME,
-		Enum.RenderPriority.Camera.Value + 1,
-		updateCamera
+		PRE_BIND_NAME,
+		Enum.RenderPriority.Camera.Value - 1,
+		preCameraUpdate
 	)
 
-	print("🎥 Premium Dynamic Camera: ON")
+	--------------------------------------------------------
+	-- DEPOIS DO CAMERA MODULE
+	--------------------------------------------------------
+
+	RunService:BindToRenderStep(
+		POST_BIND_NAME,
+		Enum.RenderPriority.Camera.Value + 1,
+		postCameraUpdate
+	)
+
+	print(
+		"🎥 Premium Dynamic Camera: ON"
+	)
 end
 
 ------------------------------------------------------------
@@ -1192,15 +1858,42 @@ local function disableCamera()
 	enabled = false
 
 	RunService:UnbindFromRenderStep(
-		BIND_NAME
+		PRE_BIND_NAME
 	)
 
+	RunService:UnbindFromRenderStep(
+		POST_BIND_NAME
+	)
+
+	--------------------------------------------------------
+	-- RESTAURA A ÚLTIMA CÂMERA LIMPA
+	--------------------------------------------------------
+
+	camera =
+		Workspace.CurrentCamera
+
+	if
+		camera
+		and
+		lastRawCameraCFrame
+	then
+
+		camera.CFrame =
+			lastRawCameraCFrame
+
+	end
+
 	positionSpring = nil
-	aimSpring = nil
+	yawCorrectionSpring = nil
+
+	lastRawCameraCFrame = nil
+	lastSafePosition = nil
 
 	clearRoute()
 
-	print("🎥 Premium Dynamic Camera: OFF")
+	print(
+		"🎥 Premium Dynamic Camera: OFF"
+	)
 end
 
 ------------------------------------------------------------
@@ -1217,12 +1910,15 @@ end
 
 UserInputService.InputBegan:Connect(
 	function(input, processed)
+
 		if processed then
 			return
 		end
 
 		if input.KeyCode == TOGGLE_KEY then
+
 			toggleCamera()
+
 		end
 	end
 )
@@ -1233,29 +1929,40 @@ UserInputService.InputBegan:Connect(
 
 player.CharacterAdded:Connect(
 	function()
+
 		positionSpring = nil
-		aimSpring = nil
+		yawCorrectionSpring = nil
+
+		lastRawCameraCFrame = nil
+		lastSafePosition = nil
 
 		clearRoute()
+
 	end
 )
 
 ------------------------------------------------------------
--- CURRENT CAMERA
+-- CURRENT CAMERA CHANGED
 ------------------------------------------------------------
 
 Workspace:GetPropertyChangedSignal(
 	"CurrentCamera"
 ):Connect(
 	function()
+
 		camera =
 			Workspace.CurrentCamera
 
 		if enabled then
+
 			positionSpring = nil
-			aimSpring = nil
+			yawCorrectionSpring = nil
+
+			lastRawCameraCFrame = nil
+			lastSafePosition = nil
 
 			clearRoute()
+
 		end
 	end
 )
