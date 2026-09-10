@@ -16,50 +16,19 @@ local POST_BIND_NAME = "SmoothCamera_Post"
 local TOGGLE_KEY = Enum.KeyCode.V
 
 ------------------------------------------------------------
--- MOVIMENTO
---
--- A posição NÃO usa Spring.
--- Usa suavização exponencial equivalente a ~0.1s.
-------------------------------------------------------------
-
-local POSITION_LERP_TIME = 0.10
-
-------------------------------------------------------------
 -- ROTAÇÃO
 --
--- Spring criticamente amortecida estilo Freecam.
+-- SOMENTE a rotação é suavizada.
 --
--- 5.2 = suave, mas sem ficar com sensação pesada
--- de atraso como 3.6.
+-- A posição fica 100% original do Roblox.
 ------------------------------------------------------------
 
-local ROTATION_FREQUENCY = 5.2
-
-------------------------------------------------------------
--- COMPENSAÇÃO HORIZONTAL LEVE
---
--- Serve apenas para compensar um pouco o atraso criado
--- pelo Lerp da posição quando o personagem se move rápido.
---
--- Não tenta colocar a câmera atrás do personagem.
-------------------------------------------------------------
-
-local POSITION_YAW_ASSIST = 0.35
-
-local YAW_SOFT_ZONE = math.rad(4)
-
-local MAX_YAW_ASSIST = math.rad(6)
-
-------------------------------------------------------------
--- ALVO
-------------------------------------------------------------
-
-local LOOK_OFFSET = Vector3.new(0, 1.45, 0)
+local ROTATION_FREQUENCY = 5.6
 
 ------------------------------------------------------------
 -- SPRING
 --
--- Usada APENAS na rotação.
+-- Criticamente amortecida, estilo Freecam.
 ------------------------------------------------------------
 
 local Spring = {}
@@ -135,97 +104,15 @@ end
 
 local enabled = false
 
-------------------------------------------------------------
--- POSIÇÃO SUAVIZADA
-------------------------------------------------------------
-
-local smoothPosition = nil
-
-------------------------------------------------------------
--- ROTAÇÃO SUAVIZADA
-------------------------------------------------------------
-
 local rotationSpring = nil
 
 ------------------------------------------------------------
 -- CÂMERA ORIGINAL
 --
--- Guarda o resultado do CameraModule do Roblox.
---
--- Antes do CameraModule rodar no próximo frame,
--- restauramos esse CFrame para nossa suavização não
--- entrar novamente no cálculo interno do Roblox.
+-- Guarda o CFrame original produzido pelo CameraModule.
 ------------------------------------------------------------
 
 local lastRawCameraCFrame = nil
-
-------------------------------------------------------------
--- CHARACTER
-------------------------------------------------------------
-
-local function getCharacter()
-	local character =
-		player.Character
-
-	if not character then
-		return nil, nil
-	end
-
-	local root =
-		character:FindFirstChild(
-			"HumanoidRootPart"
-		)
-
-	if not root then
-		return nil, nil
-	end
-
-	return character, root
-end
-
-local function getLookTarget()
-	local character, root =
-		getCharacter()
-
-	if
-		not character
-		or
-		not root
-	then
-		return nil
-	end
-
-	return
-		root.Position
-		+ LOOK_OFFSET
-end
-
-------------------------------------------------------------
--- LERP INDEPENDENTE DE FPS
---
--- Em vez de usar um alpha fixo por frame:
---
--- alpha = 1 - exp(-dt / tempo)
---
--- Assim 30 FPS, 60 FPS, 120 FPS etc.
--- mantêm praticamente a mesma sensação.
-------------------------------------------------------------
-
-local function lerpAlphaFromTime(
-	dt,
-	lerpTime
-)
-
-	if lerpTime <= 0 then
-		return 1
-	end
-
-	return
-		1
-		- math.exp(
-			-dt / lerpTime
-		)
-end
 
 ------------------------------------------------------------
 -- ANGLE UTILS
@@ -261,117 +148,6 @@ local function closestAngle(
 		)
 end
 
-local function directionToYaw(direction)
-	if
-		direction.Magnitude
-		<= 0.0001
-	then
-		return 0
-	end
-
-	direction =
-		direction.Unit
-
-	return
-		math.atan2(
-			-direction.X,
-			-direction.Z
-		)
-end
-
-------------------------------------------------------------
--- COMPENSAÇÃO DO LERP DA POSIÇÃO
---
--- Exemplo:
---
--- Roblox queria câmera aqui:
---
---       A
---
--- mas o Lerp ainda está aqui:
---
---   B
---
--- Como B está atrasado, o personagem pode sair um pouco
--- lateralmente do campo de visão.
---
--- Essa função corrige SÓ essa diferença.
-------------------------------------------------------------
-
-local function calculatePositionYawAssist(
-	rawPosition,
-	currentSmoothPosition,
-	targetPosition
-)
-
-	local rawDirection =
-		targetPosition
-		- rawPosition
-
-	local smoothDirection =
-		targetPosition
-		- currentSmoothPosition
-
-	if
-		rawDirection.Magnitude
-		<= 0.001
-		or
-		smoothDirection.Magnitude
-		<= 0.001
-	then
-		return 0
-	end
-
-	local rawTargetYaw =
-		directionToYaw(
-			rawDirection
-		)
-
-	local smoothTargetYaw =
-		directionToYaw(
-			smoothDirection
-		)
-
-	local difference =
-		shortestAngleDelta(
-			rawTargetYaw,
-			smoothTargetYaw
-		)
-
-	--------------------------------------------------------
-	-- SOFT ZONE
-	--
-	-- Pequenos desvios continuam naturais.
-	--------------------------------------------------------
-
-	local outside =
-		math.max(
-			math.abs(
-				difference
-			)
-			- YAW_SOFT_ZONE,
-			0
-		)
-
-	if outside <= 0 then
-		return 0
-	end
-
-	local correction =
-		math.sign(
-			difference
-		)
-		* outside
-		* POSITION_YAW_ASSIST
-
-	return
-		math.clamp(
-			correction,
-			-MAX_YAW_ASSIST,
-			MAX_YAW_ASSIST
-		)
-end
-
 ------------------------------------------------------------
 -- RESET
 ------------------------------------------------------------
@@ -390,17 +166,6 @@ local function resetCameraState()
 	lastRawCameraCFrame =
 		rawCFrame
 
-	--------------------------------------------------------
-	-- POSIÇÃO
-	--------------------------------------------------------
-
-	smoothPosition =
-		rawCFrame.Position
-
-	--------------------------------------------------------
-	-- ROTAÇÃO
-	--------------------------------------------------------
-
 	local pitch, yaw =
 		rawCFrame:ToOrientation()
 
@@ -417,9 +182,12 @@ end
 ------------------------------------------------------------
 -- PRE CAMERA
 --
--- ANTES do CameraModule.
+-- Antes do CameraModule:
 --
--- Remove nosso efeito do frame passado.
+-- restaura a câmera RAW anterior.
+--
+-- Assim nossa suavização não entra novamente
+-- no cálculo interno da câmera do Roblox.
 ------------------------------------------------------------
 
 local function preCameraUpdate()
@@ -445,7 +213,10 @@ end
 ------------------------------------------------------------
 -- POST CAMERA
 --
--- DEPOIS do CameraModule.
+-- Depois do CameraModule:
+--
+-- mantém a POSIÇÃO exatamente como o Roblox produziu
+-- e suaviza somente PITCH/YAW.
 ------------------------------------------------------------
 
 local function postCameraUpdate(dt)
@@ -456,49 +227,38 @@ local function postCameraUpdate(dt)
 		return
 	end
 
-	if
-		not smoothPosition
-		or
-		not rotationSpring
-	then
+	if not rotationSpring then
 		resetCameraState()
 		return
 	end
 
 	--------------------------------------------------------
-	-- RESULTADO ORIGINAL DO ROBLOX
+	-- CAMERA ORIGINAL DO ROBLOX
 	--------------------------------------------------------
 
 	local rawCFrame =
 		camera.CFrame
 
 	--------------------------------------------------------
-	-- Guarda ANTES de aplicar nossa suavização.
+	-- Guarda ANTES de aplicar nossa rotação.
 	--------------------------------------------------------
 
 	lastRawCameraCFrame =
 		rawCFrame
 
 	--------------------------------------------------------
-	-- POSIÇÃO
+	-- POSIÇÃO ORIGINAL
 	--
-	-- Lerp de aproximadamente 0.1 segundo.
+	-- SEM LERP.
+	-- SEM SPRING.
+	-- SEM ATRASO.
 	--------------------------------------------------------
 
-	local positionAlpha =
-		lerpAlphaFromTime(
-			dt,
-			POSITION_LERP_TIME
-		)
-
-	smoothPosition =
-		smoothPosition:Lerp(
-			rawCFrame.Position,
-			positionAlpha
-		)
+	local rawPosition =
+		rawCFrame.Position
 
 	--------------------------------------------------------
-	-- ROTAÇÃO ORIGINAL DO ROBLOX
+	-- ROTAÇÃO ORIGINAL
 	--------------------------------------------------------
 
 	local rawPitch, rawYaw =
@@ -507,13 +267,11 @@ local function postCameraUpdate(dt)
 	--------------------------------------------------------
 	-- YAW CONTÍNUO
 	--
-	-- Resolve passagem:
+	-- Evita o salto:
 	--
 	-- +179°
 	--   ↓
 	-- -179°
-	--
-	-- sem fazer a Spring tentar percorrer quase 360°.
 	--------------------------------------------------------
 
 	local targetYaw =
@@ -523,29 +281,7 @@ local function postCameraUpdate(dt)
 		)
 
 	--------------------------------------------------------
-	-- ASSISTÊNCIA LEVE DE POSIÇÃO
-	--------------------------------------------------------
-
-	local targetPosition =
-		getLookTarget()
-
-	if targetPosition then
-
-		local yawAssist =
-			calculatePositionYawAssist(
-				rawCFrame.Position,
-				smoothPosition,
-				targetPosition
-			)
-
-		targetYaw +=
-			yawAssist
-	end
-
-	--------------------------------------------------------
 	-- ROTATION SPRING
-	--
-	-- SOMENTE a rotação passa pela Spring.
 	--------------------------------------------------------
 
 	rotationSpring:SetFreq(
@@ -563,11 +299,14 @@ local function postCameraUpdate(dt)
 
 	--------------------------------------------------------
 	-- CÂMERA FINAL
+	--
+	-- POSIÇÃO = ORIGINAL ROBLOX
+	-- ROTAÇÃO = SUAVIZADA
 	--------------------------------------------------------
 
 	camera.CFrame =
 		CFrame.new(
-			smoothPosition
+			rawPosition
 		)
 		*
 		CFrame.fromOrientation(
@@ -590,19 +329,11 @@ local function enableCamera()
 
 	resetCameraState()
 
-	--------------------------------------------------------
-	-- ANTES DO CAMERA MODULE
-	--------------------------------------------------------
-
 	RunService:BindToRenderStep(
 		PRE_BIND_NAME,
 		Enum.RenderPriority.Camera.Value - 1,
 		preCameraUpdate
 	)
-
-	--------------------------------------------------------
-	-- DEPOIS DO CAMERA MODULE
-	--------------------------------------------------------
 
 	RunService:BindToRenderStep(
 		POST_BIND_NAME,
@@ -611,7 +342,7 @@ local function enableCamera()
 	)
 
 	print(
-		"🎥 Smooth Camera: ON"
+		"🎥 Smooth Rotation Camera: ON"
 	)
 end
 
@@ -635,7 +366,7 @@ local function disableCamera()
 	)
 
 	--------------------------------------------------------
-	-- DEVOLVE A CÂMERA ORIGINAL DO ROBLOX
+	-- DEVOLVE A CÂMERA ORIGINAL
 	--------------------------------------------------------
 
 	camera =
@@ -652,13 +383,11 @@ local function disableCamera()
 
 	end
 
-	smoothPosition = nil
 	rotationSpring = nil
-
 	lastRawCameraCFrame = nil
 
 	print(
-		"🎥 Smooth Camera: OFF"
+		"🎥 Smooth Rotation Camera: OFF"
 	)
 end
 
@@ -699,9 +428,7 @@ UserInputService.InputBegan:Connect(
 player.CharacterAdded:Connect(
 	function()
 
-		smoothPosition = nil
 		rotationSpring = nil
-
 		lastRawCameraCFrame = nil
 
 	end
@@ -721,9 +448,7 @@ Workspace:GetPropertyChangedSignal(
 
 		if enabled then
 
-			smoothPosition = nil
 			rotationSpring = nil
-
 			lastRawCameraCFrame = nil
 
 		end
